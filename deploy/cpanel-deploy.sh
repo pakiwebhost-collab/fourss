@@ -40,10 +40,7 @@ cd "$release"
 
 # Build without loading production secrets or pointing Next at live CMS files.
 npm ci --include=dev --include=optional
-DATA_DIR="$release/.build-data" SITE_URL="https://4ss.spydermesh.com" REQUIRE_EXISTING_DB=1 \
-  NODE_OPTIONS="--max-old-space-size=2048" npm run build -- --webpack
-test -s .next/BUILD_ID
-test ! -e .build-data
+bash deploy/cpanel-build.sh
 
 ln -s "$APP/.env.production" .env.production
 node app.js --check-env

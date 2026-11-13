@@ -56,8 +56,11 @@ Update from Remote**. Verify the expected HEAD and run the isolated server prefl
 clicking **Deploy HEAD Commit**. The deployment installs locked dependencies and builds with
 Webpack in a fresh release. It links the production environment after the build succeeds, checks
 its effective settings, switches `current`, then touches `tmp/restart.txt`. Builds may download
-SWC WebAssembly bindings and Google Fonts. The 2 GB Node heap limit is per process, so allow
-additional RAM for workers and disk space for dependencies, the build, and retained releases.
+SWC WebAssembly bindings and Google Fonts. The shared `deploy/cpanel-build.sh` logs the inherited
+address-space limits and raises only the build subshell's soft limit to the inherited hard limit.
+It uses Node 22's `--disable-wasm-trap-handler` and enables Next.js Webpack memory optimizations
+and a single page-data worker. The 2 GB heap setting applies to the main process and Webpack
+compiler worker. Next.js removes it from isolated page-data workers.
 
 ### AlmaLinux preflight
 
@@ -76,9 +79,7 @@ git -C "$HOME/repositories/fourss" archive HEAD | tar -x -C "$test_dir"
 cd "$test_dir"
 npm ci --include=dev --include=optional
 node -e 'const {DatabaseSync}=require("node:sqlite"); const db=new DatabaseSync(":memory:"); console.log(db.prepare("SELECT sqlite_version() AS version").get()); console.log(require("sharp").versions.sharp)'
-DATA_DIR="$test_dir/build-data" SITE_URL=https://4ss.spydermesh.com REQUIRE_EXISTING_DB=1 \
-  NODE_OPTIONS=--max-old-space-size=2048 npm run build -- --webpack
-test -s .next/BUILD_ID && test ! -e build-data
+bash deploy/cpanel-build.sh
 DATA_DIR="$test_dir/test-data" SITE_URL=https://4ss.spydermesh.com REQUIRE_EXISTING_DB=0 \
   PORT=4313 node app.js
 )
@@ -96,6 +97,17 @@ On subsequent releases, rollback consists of repointing `current`
 to the retained prior release and touching `tmp/restart.txt`. For the first migration, also keep
 a copy of the previous startup file and retain the original app directory contents. Older releases
 remain on disk for rollback. Remove unused releases after confirming they are no longer serving.
+
+If the build still aborts, capture the last Next.js phase and the limits reported by the failing
+execution context. In the cPanel terminal, run `ulimit -Sa; ulimit -Ha` and, if readable,
+`cat /proc/$$/limits`. The terminal and Git deployment task can inherit different limits.
+A hard address-space cap, a data-segment limit, or an account memory limit can prevent V8 from
+growing the heap well below its configured ceiling. WHM `maxmem` and the Node heap setting alone
+do not establish the worker's available memory. If the terminal preflight succeeds but the Git
+task fails, run the same checked-out deployment script as the app user from the working terminal
+context. If both contexts are capped, build in a clean AlmaLinux 8/GLIBC 2.28 environment with the
+same architecture and Node version, then transfer the tested release without secrets or data and
+activate it as a separate manual procedure. Windows build output is unsuitable for that transfer.
 
 ---
 

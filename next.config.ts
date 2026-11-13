@@ -11,6 +11,10 @@ const nextConfig: NextConfig = {
   },
   experimental: {
     serverActions: { bodySizeLimit: "4mb" },
+    ...(process.env.CPANEL_BUILD === "1" && {
+      cpus: 1,
+      webpackMemoryOptimizations: true,
+    }),
   },
   async redirects() {
     return [
