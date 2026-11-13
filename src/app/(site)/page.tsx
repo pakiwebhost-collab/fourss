@@ -29,13 +29,14 @@ export default function HomePage() {
   const clients = listClients();
   const posts = latestPosts(3);
   const { hero, stats, about, recruitment, equipment, trust } = home;
+  const siteUrl = process.env.SITE_URL || "https://4ssecurity.pk";
 
   const jsonLd = {
     "@context": "https://schema.org",
     "@type": "SecurityService",
     name: site.companyName,
-    url: "https://4ssecurity.pk/",
-    logo: "https://4ssecurity.pk/brand/logo-dark.webp",
+    url: new URL("/", siteUrl).href,
+    logo: new URL("/brand/logo-dark.webp", siteUrl).href,
     telephone: site.phones[0]?.number,
     email: site.email,
     foundingDate: "1994-03-07",

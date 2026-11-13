@@ -26,18 +26,19 @@ export default function PostView({ post }: { post: PostRow }) {
   const site = getSite();
   const { html, toc } = withHeadingIds(post.body);
   const related = latestPosts(3, post.id);
-  const url = `https://4ssecurity.pk/${post.slug}/`;
+  const siteUrl = process.env.SITE_URL || "https://4ssecurity.pk";
+  const url = new URL(`/${post.slug}/`, siteUrl).href;
   const tags = post.tags.split(",").map((t) => t.trim()).filter(Boolean);
   const jsonLd = {
     "@context": "https://schema.org",
     "@type": "BlogPosting",
     headline: post.title,
     description: post.excerpt,
-    image: post.cover ? `https://4ssecurity.pk${post.cover}` : undefined,
+    image: post.cover ? new URL(post.cover, siteUrl).href : undefined,
     datePublished: post.published_at,
     dateModified: post.updated_at,
     author: { "@type": "Organization", name: post.author },
-    publisher: { "@type": "Organization", name: site.companyName, logo: { "@type": "ImageObject", url: "https://4ssecurity.pk/brand/logo-dark.webp" } },
+    publisher: { "@type": "Organization", name: site.companyName, logo: { "@type": "ImageObject", url: new URL("/brand/logo-dark.webp", siteUrl).href } },
     mainEntityOfPage: url,
   };
 

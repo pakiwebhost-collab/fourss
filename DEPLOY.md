@@ -37,15 +37,65 @@ Works on DigitalOcean, Hetzner, Contabo, AWS Lightsail and similar (1 GB RAM is 
 
 ---
 
-## Option B — cPanel / Hostinger "Node.js App"
+## Option B — Manual cPanel Git deployment with Passenger
 
-1. In the hosting panel, create a Node.js application: Node version **22 or 24**, application root = the
-   uploaded folder, startup file `node_modules/next/dist/bin/next` with argument `start`
-   (or the panel's "npm start" option).
-2. Add the environment variables from `.env.example` in the panel (at minimum `SITE_URL`,
-   `SESSION_SECRET`, `SMTP_*`). Set `DATA_DIR` to a folder **outside** `public_html` if possible.
-3. Run `npm ci` and `npm run build` from the panel's terminal / "Run NPM install" button.
-4. Restart the app and point the domain to it.
+For the 4SS demo, register `4ss.spydermesh.com` at `/` in Application Manager, using
+`apps/fourss` as the application path, the production environment, and Passenger's default
+`app.js` startup file. Confirm Passenger uses `/opt/cpanel/ea-nodejs22/bin/node` and runs as
+`websitemake4u`. Use `/home/websitemake4u/repositories/fourss` for the separate cPanel Git checkout.
+
+The existing `/home/websitemake4u/apps/fourss/.env.production` must be readable by the app user.
+Confirm the effective `SITE_URL=https://4ss.spydermesh.com`, `DATA_DIR=/home/websitemake4u/4ss-data`,
+and `SESSION_SECRET` (at least 32 characters). Keep secure cookies enabled. Passenger-injected
+environment variables take precedence over `.env.production`. The existing SQLite database,
+its directory, and the uploads directory must be writable by the app user for WAL and CMS uploads.
+Keep the environment, SQLite database, and uploads outside the Git checkout and document root.
+
+After the desired commit reaches GitHub, use **Git Version Control → Manage → Pull or Deploy →
+Update from Remote**. Verify the expected HEAD and run the isolated server preflight below before
+clicking **Deploy HEAD Commit**. The deployment installs locked dependencies and builds with
+Webpack in a fresh release. It links the production environment after the build succeeds, checks
+its effective settings, switches `current`, then touches `tmp/restart.txt`. Builds may download
+SWC WebAssembly bindings and Google Fonts. The 2 GB Node heap limit is per process, so allow
+additional RAM for workers and disk space for dependencies, the build, and retained releases.
+
+### AlmaLinux preflight
+
+Run as the cPanel app user from a terminal after **Update from Remote**. This builds and starts
+an isolated copy with a fresh test database. Keep the terminal open while running the smoke checks.
+
+```bash
+(
+set -euo pipefail
+export PATH="/opt/cpanel/ea-nodejs22/bin:$PATH"
+node -v
+getconf GNU_LIBC_VERSION
+command -v git tar flock install
+test_dir=$(mktemp -d "$HOME/4ss-preflight.XXXXXXXX")
+git -C "$HOME/repositories/fourss" archive HEAD | tar -x -C "$test_dir"
+cd "$test_dir"
+npm ci --include=dev --include=optional
+node -e 'const {DatabaseSync}=require("node:sqlite"); const db=new DatabaseSync(":memory:"); console.log(db.prepare("SELECT sqlite_version() AS version").get()); console.log(require("sharp").versions.sharp)'
+DATA_DIR="$test_dir/build-data" SITE_URL=https://4ss.spydermesh.com REQUIRE_EXISTING_DB=1 \
+  NODE_OPTIONS=--max-old-space-size=2048 npm run build -- --webpack
+test -s .next/BUILD_ID && test ! -e build-data
+DATA_DIR="$test_dir/test-data" SITE_URL=https://4ss.spydermesh.com REQUIRE_EXISTING_DB=0 \
+  PORT=4313 node app.js
+)
+```
+
+From a second terminal run `curl -fsS http://127.0.0.1:4313/ -o /dev/null`,
+`curl -fsS http://127.0.0.1:4313/admin/login/ -o /dev/null`, and
+`curl -fsS http://127.0.0.1:4313/sitemap.xml | grep -F 'https://4ss.spydermesh.com/'`.
+Stop the test process with Ctrl+C. Check the actual Passenger integration separately using an
+isolated staging registration where available. Before a live activation, take a consistent SQLite
+backup and retain the prior app release. After activation, check Passenger logs, HTTPS redirects,
+admin login, and static assets. Next.js fetches Server Action redirect responses through the
+demo origin under Passenger, so confirm the app user can reach that HTTPS origin from the VPS.
+On subsequent releases, rollback consists of repointing `current`
+to the retained prior release and touching `tmp/restart.txt`. For the first migration, also keep
+a copy of the previous startup file and retain the original app directory contents. Older releases
+remain on disk for rollback. Remove unused releases after confirming they are no longer serving.
 
 ---
 

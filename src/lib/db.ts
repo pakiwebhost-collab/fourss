@@ -1,5 +1,6 @@
 import "server-only";
 import { DatabaseSync } from "node:sqlite";
+import { PHASE_PRODUCTION_BUILD } from "next/constants";
 import fs from "node:fs";
 import path from "node:path";
 import { runSeed } from "@/seed";
@@ -128,21 +129,38 @@ CREATE TABLE IF NOT EXISTS login_attempts (
 
 type G = typeof globalThis & { __fsdb?: DatabaseSync };
 
-function open(): DatabaseSync {
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-  const db = new DatabaseSync(path.join(DATA_DIR, "site.db"));
-  db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
-  db.exec(SCHEMA);
-  return db;
-}
-
 export function db(): DatabaseSync {
+  if (process.env.NEXT_PHASE === PHASE_PRODUCTION_BUILD) {
+    throw new Error("SQLite is available only at runtime.");
+  }
+
   const g = globalThis as G;
   if (!g.__fsdb) {
-    g.__fsdb = open();
-    // First run: populate the database with the content migrated from the old site.
-    const count = g.__fsdb.prepare("SELECT COUNT(*) AS n FROM pages").get() as { n: number };
-    if (!count.n) runSeed(g.__fsdb);
+    const file = path.join(DATA_DIR, "site.db");
+    const requireExisting = process.env.REQUIRE_EXISTING_DB === "1";
+    if (requireExisting && (!fs.existsSync(file) || fs.statSync(file).size === 0)) {
+      throw new Error("The existing CMS database is missing or empty.");
+    }
+
+    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+    const connection = new DatabaseSync(file);
+    try {
+      connection.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+      if (requireExisting) {
+        // A deployed CMS must use its existing schema and content.
+        connection.prepare("SELECT id FROM pages LIMIT 1").get();
+        if (!connection.prepare("SELECT id FROM users WHERE role = 'admin' LIMIT 1").get()) {
+          throw new Error("The existing CMS database has no admin account.");
+        }
+      } else {
+        connection.exec(SCHEMA);
+        if (!connection.prepare("SELECT id FROM pages LIMIT 1").get()) runSeed(connection);
+      }
+      g.__fsdb = connection;
+    } catch (error) {
+      connection.close();
+      throw error;
+    }
   }
   return g.__fsdb;
 }

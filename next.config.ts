@@ -21,14 +21,6 @@ const nextConfig: NextConfig = {
       { source: "/wp-admin", destination: "/admin/", permanent: false },
     ];
   },
-  turbopack: {
-    rules: {
-      "*.css": {
-        loaders: ["@tailwindcss/turbopack"],
-        as: "*.css",
-      },
-    },
-  },
 };
 
 export default nextConfig;
