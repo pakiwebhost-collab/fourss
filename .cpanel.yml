@@ -1,0 +1,4 @@
+---
+deployment:
+  tasks:
+    - /bin/bash /home/websitemake4u/repositories/fourss/deploy/cpanel-deploy.sh
