@@ -1,5 +1,7 @@
 import type { NextConfig } from "next";
 
+const cpanelBuild = process.env.CPANEL_BUILD === "1";
+
 const nextConfig: NextConfig = {
   // Keep WordPress-style URLs (e.g. /about-us/) so existing links and SEO rankings carry over.
   trailingSlash: true,
@@ -11,11 +13,19 @@ const nextConfig: NextConfig = {
   },
   experimental: {
     serverActions: { bodySizeLimit: "4mb" },
-    ...(process.env.CPANEL_BUILD === "1" && {
+    ...(cpanelBuild && {
       cpus: 1,
+      // Keep each sequential compiler in a fresh process despite the custom hook.
+      webpackBuildWorker: true,
       webpackMemoryOptimizations: true,
     }),
   },
+  ...(cpanelBuild && {
+    webpack(config) {
+      config.parallelism = 4;
+      return config;
+    },
+  }),
   async redirects() {
     return [
       { source: "/services", destination: "/our-services/", permanent: true },

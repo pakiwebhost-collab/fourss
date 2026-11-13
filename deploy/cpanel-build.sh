@@ -15,7 +15,9 @@ set -Eeuo pipefail
     fi
   fi
 
+  # Bound native allocator arenas and CSS worker threads for the build and its children.
   CPANEL_BUILD=1 DATA_DIR="$PWD/.build-data" SITE_URL="https://4ss.spydermesh.com" REQUIRE_EXISTING_DB=1 \
+    MALLOC_ARENA_MAX=2 RAYON_NUM_THREADS=2 \
     NODE_OPTIONS="--max-old-space-size=2048 --disable-wasm-trap-handler" \
     npm run build -- --webpack
   test -s .next/BUILD_ID

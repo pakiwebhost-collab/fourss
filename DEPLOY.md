@@ -58,28 +58,33 @@ Webpack in a fresh release. It links the production environment after the build 
 its effective settings, switches `current`, then touches `tmp/restart.txt`. Builds may download
 SWC WebAssembly bindings and Google Fonts. The shared `deploy/cpanel-build.sh` logs the inherited
 address-space limits and raises only the build subshell's soft limit to the inherited hard limit.
-It uses Node 22's `--disable-wasm-trap-handler` and enables Next.js Webpack memory optimizations
-and a single page-data worker. The 2 GB heap setting applies to the main process and Webpack
-compiler worker. Next.js removes it from isolated page-data workers.
+It uses Node 22's `--disable-wasm-trap-handler`, limits glibc malloc arenas and native CSS
+Rayon threads to two each, and lets Webpack process up to four modules at a time. Next.js keeps
+the server, edge, and client compilations in separate, sequential workers and uses one page-data
+worker. The 2 GB heap setting applies to the main process and Webpack compiler worker. Next.js
+removes it from isolated page-data workers.
 
 ### AlmaLinux preflight
 
-Run as the cPanel app user from a terminal after **Update from Remote**. This builds and starts
-an isolated copy with a fresh test database. Keep the terminal open while running the smoke checks.
+Run as the cPanel app user from a terminal after **Update from Remote**. The subshell enforces the
+same 8 GiB soft and hard address-space limits as cPanel. It builds and starts an isolated copy with
+a fresh test database. Keep the terminal open while running the smoke checks.
 
 ```bash
 (
 set -euo pipefail
 export PATH="/opt/cpanel/ea-nodejs22/bin:$PATH"
-node -v
-getconf GNU_LIBC_VERSION
+test "$(node -v)" = v22.23.4
+test "$(getconf GNU_LIBC_VERSION)" = 'glibc 2.28'
 command -v git tar flock install
+ulimit -S -H -v 8388608
 test_dir=$(mktemp -d "$HOME/4ss-preflight.XXXXXXXX")
 git -C "$HOME/repositories/fourss" archive HEAD | tar -x -C "$test_dir"
 cd "$test_dir"
 npm ci --include=dev --include=optional
 node -e 'const {DatabaseSync}=require("node:sqlite"); const db=new DatabaseSync(":memory:"); console.log(db.prepare("SELECT sqlite_version() AS version").get()); console.log(require("sharp").versions.sharp)'
-bash deploy/cpanel-build.sh
+DEBUG=next:build:webpack-build bash deploy/cpanel-build.sh 2>&1 | tee build.log
+grep -F 'next-swc build: wasm build' build.log
 DATA_DIR="$test_dir/test-data" SITE_URL=https://4ss.spydermesh.com REQUIRE_EXISTING_DB=0 \
   PORT=4313 node app.js
 )
@@ -100,14 +105,20 @@ remain on disk for rollback. Remove unused releases after confirming they are no
 
 If the build still aborts, capture the last Next.js phase and the limits reported by the failing
 execution context. In the cPanel terminal, run `ulimit -Sa; ulimit -Ha` and, if readable,
-`cat /proc/$$/limits`. The terminal and Git deployment task can inherit different limits.
+`cat /proc/$$/limits`. During compilation, read `VmPeak`, `VmSize`, `VmRSS`, and `Threads` from
+`/proc/<compiler-pid>/status`, and inspect `/proc/<compiler-pid>/maps` if available. V8's heap
+statistics cover only part of the virtual address space. The terminal and Git deployment task can
+inherit different limits.
 A hard address-space cap, a data-segment limit, or an account memory limit can prevent V8 from
 growing the heap well below its configured ceiling. WHM `maxmem` and the Node heap setting alone
 do not establish the worker's available memory. If the terminal preflight succeeds but the Git
 task fails, run the same checked-out deployment script as the app user from the working terminal
-context. If both contexts are capped, build in a clean AlmaLinux 8/GLIBC 2.28 environment with the
-same architecture and Node version, then transfer the tested release without secrets or data and
-activate it as a separate manual procedure. Windows build output is unsuitable for that transfer.
+context. If both contexts fail under the cap, build in a clean AlmaLinux 8/GLIBC 2.28 environment
+with the same architecture and Node version. Stage the tested release on the VPS under the Git
+commit SHA, then manually activate it with the same `current` symlink and Passenger restart. Keep
+production secrets and data outside the artifact. To retain **Deploy HEAD Commit** with off-server
+builds, the deploy hook would need an explicit artifact verification and activation step in place
+of the local compilation. Windows build output is unsuitable for that transfer.
 
 ---
 
