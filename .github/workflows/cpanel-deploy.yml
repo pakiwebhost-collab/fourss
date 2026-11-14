@@ -1,0 +1,57 @@
+name: Deploy to cPanel
+
+on:
+  workflow_dispatch:
+    inputs:
+      verify_only:
+        description: Verify the signed release without activating it
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: fourss-cpanel-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.repository == 'pakiwebhost-collab/fourss' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    environment: cpanel-production
+    steps:
+      - name: Verify or activate the selected main release
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.FOURSS_DEPLOY_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ vars.FOURSS_SSH_KNOWN_HOSTS }}
+          SSH_HOST: ${{ vars.FOURSS_SSH_HOST }}
+          SSH_PORT: ${{ vars.FOURSS_SSH_PORT }}
+          VERIFY_ONLY: ${{ inputs.verify_only }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$SSH_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] ||
+            { echo "Configure FOURSS_SSH_HOST in cpanel-production"; exit 1; }
+          port=${SSH_PORT:-22}
+          if ! [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] || (( port > 65535 )); then
+            echo "Invalid FOURSS_SSH_PORT"
+            exit 1
+          fi
+          if [[ -z "$SSH_PRIVATE_KEY" || -z "$SSH_KNOWN_HOSTS" ]]; then
+            echo "Configure the deployment key and pinned known_hosts entry in cpanel-production"
+            exit 1
+          fi
+          scratch=$(mktemp -d)
+          trap 'rm -rf -- "$scratch"' EXIT
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$scratch/key"
+          unset SSH_PRIVATE_KEY
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$scratch/known_hosts"
+          request=deploy
+          if [[ "$VERIFY_ONLY" == true ]]; then request=verify; fi
+          ssh -F /dev/null -T -p "$port" -i "$scratch/key" \
+            -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 \
+            -o ServerAliveCountMax=3 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -o "UserKnownHostsFile=$scratch/known_hosts" -o GlobalKnownHostsFile=/dev/null \
+            "websitemake4u@$SSH_HOST" "$request $GITHUB_SHA"

@@ -12,6 +12,23 @@ VERIFIER="$(dirname -- "${BASH_SOURCE[0]}")/verify-release.py"
 
 die() { echo "4SS deployment: $*" >&2; exit 1; }
 
+head_commit() {
+  if [[ "$mode" = ssh-deploy || "$mode" = ssh-verify ]]; then
+    local head git_bin
+    git_bin=$(command -v git) || return 1
+    [[ "$git_bin" = /* && -x "$git_bin" ]] || return 1
+    head=$(cd / && env -i PATH="$PATH" HOME=/home/websitemake4u \
+      GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+      timeout 15s "$git_bin" ls-remote --exit-code https://github.com/pakiwebhost-collab/fourss.git refs/heads/main) ||
+      return 1
+    [[ "$head" =~ ^([a-f0-9]{40})$'\t'refs/heads/main$ ]] || return 1
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  else
+    [[ "$(git -C "$REPO" symbolic-ref --quiet HEAD)" = refs/heads/main ]] || return 1
+    git -C "$REPO" rev-parse --verify HEAD^{commit}
+  fi
+}
+
 download() (
   # Bound writes even with cPanel curl versions that only check Content-Length.
   local cap=$(( ($4 + 1023) / 1024 )) current
@@ -97,15 +114,34 @@ verify_only() (
   scratch=$(mktemp -d /tmp/fourss-verify.XXXXXXXX)
   trap 'rm -rf -- "$scratch"' EXIT
   mkdir "$scratch/release"
-  prepare "$2" "$scratch" "$scratch/release"
-  echo "Verified and unpacked $2 in scratch space. Activation skipped."
+  prepare "$1" "$scratch" "$scratch/release"
+  echo "Verified and unpacked $1 in scratch space. Activation skipped."
 )
 
+mode=cpanel
 if [[ "${1:-}" == --verify-only && $# == 2 ]]; then
-  verify_only "$@"
+  verify_only "$2"
   exit "$?"
 fi
-(( $# == 0 )) || die "Usage: cpanel-deploy.sh [--verify-only FULL_SHA]"
+if [[ $# == 1 && ( "$1" == --ssh || "$1" == --ssh-verify-only ) ]]; then
+  export PATH=/usr/local/cpanel/3rdparty/lib/path-bin:/usr/local/cpanel/3rdparty/bin:/usr/bin:/bin
+  # sshd supplies the request as data. Only these tokens and one full SHA are accepted.
+  [[ "${SSH_ORIGINAL_COMMAND:-}" =~ ^(verify|deploy)\ ([a-f0-9]{40})$ ]] ||
+    die "Expected 'verify FULL_SHA' or 'deploy FULL_SHA'"
+  request=${BASH_REMATCH[1]}
+  requested_sha=${BASH_REMATCH[2]}
+  if [[ "$request" = verify ]]; then
+    mode=ssh-verify
+    commit=$(head_commit) || die "Could not resolve GitHub main using the jailed Git PATH"
+    [[ "$commit" = "$requested_sha" ]] || die "Requested SHA is not current GitHub main"
+    verify_only "$requested_sha"
+    exit "$?"
+  fi
+  [[ "$1" = --ssh ]] || die "Deployment is disabled for this key"
+  mode=ssh-deploy
+elif (( $# != 0 )); then
+  die "Usage: cpanel-deploy.sh [--verify-only FULL_SHA]"
+fi
 test -x "$NODE" || die "EA Node.js 22 is required"
 test -r "$APP/.env.production" || die "Production environment is missing or unreadable"
 test -s "$DATA/site.db" && test -r "$DATA/site.db" && test -w "$DATA/site.db" && test -w "$DATA" ||
@@ -142,9 +178,11 @@ if re.fullmatch(r"[a-f0-9]{40}", commit) and any(
 PY
 ) || die "Could not inspect the previous release"
 
-commit=$(git -C "$REPO" rev-parse --verify HEAD^{commit})
-[[ "$commit" =~ ^[a-f0-9]{40}$ ]] || die "Invalid repository HEAD"
-[[ "$(git -C "$REPO" symbolic-ref --quiet HEAD)" == refs/heads/main ]] || die "Expected checked-out main"
+commit=$(head_commit) || die "Could not resolve main"
+[[ "$commit" =~ ^[a-f0-9]{40}$ ]] || die "Invalid main commit"
+if [[ "$mode" = ssh-deploy && "$commit" != "$requested_sha" ]]; then
+  die "Requested SHA is not current GitHub main"
+fi
 work=$(mktemp -d "$APP/tmp/prebuilt.XXXXXXXX")
 release=""
 activating=0
@@ -198,9 +236,8 @@ prepare "$commit" "$work" "$release"
 ln -s -- "$APP/.env.production" "$release/.env.production"
 (cd "$release" && timeout 10s "$NODE" app.js --check-env) || die "Production environment check failed"
 "$NODE" --check "$release/app.js" || die "Candidate Passenger launcher has invalid syntax"
-[[ "$(git -C "$REPO" symbolic-ref --quiet HEAD)" == refs/heads/main &&
-   "$(git -C "$REPO" rev-parse --verify HEAD^{commit})" = "$commit" ]] ||
-  die "Checkout advanced while preparing the release. Retry Deploy HEAD Commit"
+[[ "$(head_commit)" = "$commit" ]] ||
+  die "Main changed or could not be verified while preparing the release. Retry from current main"
 
 # Keep a persistent recovery record before the first live change.
 mkdir "$work/recovery"

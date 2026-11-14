@@ -37,13 +37,22 @@ Works on DigitalOcean, Hetzner, Contabo, AWS Lightsail and similar (1 GB RAM is 
 
 ---
 
-## Option B — Manual cPanel Git deployment with Passenger
+## Option B — Manual GitHub Actions deployment to cPanel Passenger
 
 Production uses the cPanel account `websitemake4u`, the Git checkout at
 `/home/websitemake4u/repositories/fourss`, and the Passenger app at
 `/home/websitemake4u/apps/fourss` with EA Node.js 22.23.4 and `app.js`.
 The existing `.env.production`, SQLite DB and uploads keep their current locations.
 Only GitHub Actions installs npm dependencies and builds the application.
+
+Push to `main` and wait for **Build cPanel release** to publish all three signed assets
+for the commit. In **Actions → Deploy to cPanel → Run workflow**, select `main` and run
+with **Verify only** unchecked. That is the only deployment action during normal updates.
+The dispatched workflow sends its exact commit SHA to the account's restricted SSH command.
+The server checks that SHA against GitHub `main`, then rechecks immediately before activation.
+A newer push invalidates an older queued deployment. The cPanel-managed checkout is left
+as-is. Its recorded last deployment describes its own hook history, while the Actions log
+and SHA response describe the live release.
 
 ### One-time signing setup
 
@@ -81,6 +90,66 @@ Previously installed releases can still be rolled back locally. New activations 
 manifest signed with the currently trusted key. For a failed publish, inspect any draft for
 that exact SHA and remove an incomplete draft before rerunning. A published immutable release
 is retained. Push a new approved commit when rebuilding a published artifact.
+
+### One-time SSH setup and approval sequence
+
+1. Approve and push the reviewed CI/workflow changes. Confirm the exact commit's hosted Linux
+   build and unpacked smoke test pass and the protected publish job signs the three assets.
+   Publication does not contact the VPS. Keep the trusted release-signing public key from the
+   previous setup pinned on the account.
+2. Generate a dedicated Ed25519 deployment SSH key on a trusted workstation outside this repo.
+   Put the automation private key in GitHub **Settings → Environments → cpanel-production** as
+   `FOURSS_DEPLOY_SSH_KEY`. Restrict the environment to the branch `main` and protect workflow
+   edits through normal branch review. Use an environment secret, separate from the signing key.
+   Add environment variables `FOURSS_SSH_HOST`, `FOURSS_SSH_PORT` (default `22`), and
+   `FOURSS_SSH_KNOWN_HOSTS`. Obtain and verify the server host key through an existing trusted
+   login or the hosting provider. For a nonstandard port use `[hostname]:port` in the pinned
+   `known_hosts` entry. The workflow requires key-only authentication and strict host checking.
+
+   ```bash
+   ssh-keygen -t ed25519 -f ./fourss-actions -C fourss-actions
+   ```
+
+   Generate the automation key without a passphrase for this noninteractive job. Keep the
+   private file in a secure location until it has been stored as the environment secret.
+3. After approval for account-level setup, use cPanel File Manager to upload the reviewed
+   `deploy/cpanel-deploy.sh` and `deploy/verify-release.py` into
+   `/home/websitemake4u/.config/fourss`. Keep that directory private and outside the Git
+   checkout, document root and releases. Future changes to these two trusted files require
+   a reviewed account-level update. Routine application deployments use the installed copies.
+   With hidden files visible, append exactly one restricted key line to
+   `/home/websitemake4u/.ssh/authorized_keys`, preserving the existing entries. Use owner-only
+   permissions on the directory and file. Remove any unrestricted duplicate of this key.
+   The cPanel key authorization screen must not create a second unrestricted entry.
+
+   ```text
+   restrict,command="/usr/bin/env -i HOME=/home/websitemake4u PATH=/usr/bin:/bin SSH_ORIGINAL_COMMAND=\"$SSH_ORIGINAL_COMMAND\" /bin/bash /home/websitemake4u/.config/fourss/cpanel-deploy.sh --ssh-verify-only" ssh-ed25519 AAAA... fourss-actions
+   ```
+
+4. Run the Actions deployment with **Verify only** checked. Confirm it reaches the account
+   under the existing jail and verifies the signed artifact. Confirm the test key rejects a
+   deployment request, arbitrary commands and forwarding. Use disposable checks below to
+   validate Passenger activation and rollback. If the runner cannot reach the current SSH
+   endpoint, leave the SSH and firewall settings as they are and investigate the alternative
+   below.
+5. After a separate production approval, edit that single key entry to replace
+   `--ssh-verify-only` with `--ssh`. Use **Deploy to cPanel → Run workflow** on `main`.
+   A successful job reports the verified serving SHA. A failed job carries the remote error
+   and rollback outcome. If the SSH connection is interrupted, check the serving SHA and
+   the recovery record before retrying. To revoke this capability, remove that one key entry
+   and delete the environment secret.
+
+The forced command accepts only a verification or deployment request with a full SHA.
+It passes the requested command as quoted data in a clean environment. The installer
+prefers Git from `/usr/local/cpanel/3rdparty/lib/path-bin` in its fixed SSH PATH and clears
+inherited Git settings for the outbound HTTPS lookup.
+The limited key can still request activation of a valid signed current-main release once enabled.
+Anyone who can edit the trusted scripts or deploy from the same account has the account's
+existing privileges. Preserve Jailed Shell and use a fixed host key. If an API fallback is
+needed, assess cPanel UAPI Git synchronization and `VersionControlDeployment::create` on the
+disposable repository. That API queues the hook, so polling and a matching HTTPS release
+check are needed to establish the outcome. Confirm exact-SHA synchronization and token
+scope on cPanel 126 first. A full-account API token is broader than the restricted SSH key.
 
 ### Disposable cPanel Git task
 
@@ -134,10 +203,9 @@ check to fail. Confirm recovery of the prior launcher and symlink, and that the 
 SQLite file and uploads remain outside the releases. Keep the production paths out of both
 tests.
 
-### Live workflow after validation and approval
+### Activation and rollback after validation and approval
 
-Push only to GitHub. Wait for Actions to publish the exact commit's release. In the production
-checkout use **Update from Remote**, confirm the SHA, then **Deploy HEAD Commit**. The hook
+The Actions workflow invokes the trusted installer through the restricted SSH key. The installer
 downloads and verifies the signed manifest before fetching the archive. It checks the digest
 and runtime layout, rejects escaping paths and links, and leaves the existing release active
 until candidate validation succeeds. It replaces the launcher atomically only when its
