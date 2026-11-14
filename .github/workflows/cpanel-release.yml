@@ -1,0 +1,96 @@
+name: Build cPanel release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: cpanel-release-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'pakiwebhost-collab/fourss' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Build and smoke-test the release on AlmaLinux 8
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 -t fourss-release-build - < deploy/ci-almalinux8.Dockerfile
+          source_dir=$(mktemp -d)
+          output_dir="$RUNNER_TEMP/fourss-release"
+          mkdir "$output_dir"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git archive "$GITHUB_SHA" | tar -x -C "$source_dir"
+          docker run --rm --platform linux/amd64 --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp -e NEXT_TELEMETRY_DISABLED=1 \
+            -v "$source_dir:/work" -v "$output_dir:/output" -w /work \
+            fourss-release-build bash deploy/package-release.sh "$GITHUB_SHA" /output
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        id: upload
+        with:
+          name: release-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/fourss-release/fourss-linux-x64.tar.gz
+            ${{ runner.temp }}/fourss-release/manifest.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+          overwrite: true
+
+  publish:
+    needs: build
+    if: needs.build.result == 'success' && needs.build.outputs.artifact-id != '' && github.repository == 'pakiwebhost-collab/fourss' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: cpanel-release-signing
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: ${{ runner.temp }}/fourss-release
+      - name: Check manifest and sign the tested artifact
+        working-directory: ${{ runner.temp }}/fourss-release
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.FOURSS_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          archive=fourss-linux-x64.tar.gz
+          digest=$(sha256sum "$archive")
+          jq -e --arg sha "$GITHUB_SHA" --arg digest "${digest%% *}" \
+            --argjson bytes "$(wc -c < "$archive")" \
+            '. == {version:1,repository:"pakiwebhost-collab/fourss",commit:$sha,
+              target:"linux-x64-glibc-2.28",node:"22.23.4",archive:"fourss-linux-x64.tar.gz",
+              bytes:$bytes,sha256:$digest}' manifest.json >/dev/null
+          key=$(mktemp)
+          trap 'rm -f -- "$key"' EXIT
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key"
+          unset RELEASE_SIGNING_KEY
+          openssl dgst -sha256 -sign "$key" -out manifest.sig manifest.json
+      - name: Publish the complete commit-addressed release
+        working-directory: ${{ runner.temp }}/fourss-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="cpanel-$GITHUB_SHA"
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --draft --latest=false --title "cPanel $GITHUB_SHA" \
+            --notes "Prebuilt AlmaLinux 8 release for $GITHUB_SHA." \
+            fourss-linux-x64.tar.gz manifest.json manifest.sig
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest=false

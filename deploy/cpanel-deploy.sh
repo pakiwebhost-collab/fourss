@@ -5,48 +5,220 @@ umask 077
 REPO="/home/websitemake4u/repositories/fourss"
 APP="/home/websitemake4u/apps/fourss"
 DATA="/home/websitemake4u/4ss-data"
-NODE_BIN="/opt/cpanel/ea-nodejs22/bin"
-export PATH="$NODE_BIN:$PATH"
+KEY="/home/websitemake4u/.config/fourss/release-signing.pub.pem"
+SITE="https://4ss.spydermesh.com"
+NODE="/opt/cpanel/ea-nodejs22/bin/node"
+VERIFIER="$(dirname -- "${BASH_SOURCE[0]}")/verify-release.py"
 
-test -x "$NODE_BIN/node" && test -x "$NODE_BIN/npm" || { echo "cPanel Node.js 22 and npm are required"; exit 1; }
-test -r "$APP/.env.production" || { echo "Production environment is missing or unreadable"; exit 1; }
+die() { echo "4SS deployment: $*" >&2; exit 1; }
+
+download() (
+  # Bound writes even with cPanel curl versions that only check Content-Length.
+  local cap=$(( ($4 + 1023) / 1024 )) current
+  current=$(ulimit -Sf) || return 1
+  if [[ "$current" == unlimited ]] || (( current > cap )); then
+    ulimit -Sf "$cap" || return 1
+  fi
+  curl -q --fail --silent --show-error --location --max-redirs 3 \
+    --proto '=https' --proto-redir '=https' --connect-timeout 8 --max-time "$3" \
+    --max-filesize "$4" --output "$2" "$1"
+)
+
+prepare() {
+  local commit=$1 work=$2 release=$3
+  local base="https://github.com/pakiwebhost-collab/fourss/releases/download/cpanel-$commit"
+  local archive=fourss-linux-x64.tar.gz size
+  [[ "$commit" =~ ^[a-f0-9]{40}$ ]] || die "Expected full Git commit SHA"
+  [[ -f "$KEY" && ! -L "$KEY" && -r "$KEY" ]] || die "Install the trusted release public key at $KEY"
+  echo "Downloading signed metadata for $commit"
+  download "$base/manifest.json" "$work/manifest.json" 15 4096 ||
+    die "Manifest unavailable. Check the Actions run for $commit"
+  download "$base/manifest.sig" "$work/manifest.sig" 15 8192 ||
+    die "Manifest signature unavailable"
+  openssl dgst -sha256 -verify "$KEY" -signature "$work/manifest.sig" "$work/manifest.json" ||
+    die "Invalid manifest signature"
+  size=$(python3 -I -B "$VERIFIER" size "$work/manifest.json" "$commit") ||
+    die "Invalid release metadata"
+  download "$base/$archive" "$work/$archive" 90 "$size" || die "Archive download failed"
+  timeout 45s python3 -I -B "$VERIFIER" extract \
+    "$work/manifest.json" "$commit" "$work/$archive" "$release" || die "Archive verification or extraction failed"
+  test "$("$NODE" -v)" = v22.23.4 && test "$(uname -m)" = x86_64 &&
+    test "$(getconf GNU_LIBC_VERSION)" = 'glibc 2.28' || die "Unexpected host Node version or Linux ABI"
+}
+
+health() {
+  local expected=$1 output=$2 deadline=$((SECONDS + 25)) status
+  [[ "$expected" =~ ^[a-f0-9]{40}$ ]] || return 1
+  while (( SECONDS < deadline )); do
+    if status=$(curl -q --silent --show-error --proto '=https' --connect-timeout 2 --max-time 4 \
+        -H 'Cache-Control: no-cache, no-store' -D "$output" -o /dev/null \
+        -w '%{http_code}' "$SITE/?release_check=$(openssl rand -hex 12)") &&
+        [[ "$status" = 200 ]] &&
+        awk -v sha="$expected" '
+          tolower($1) == "x-4ss-release:" { sub(/\r$/, "", $2); match_count++; found = ($2 == sha) }
+          END { exit !(found && match_count == 1) }
+        ' "$output"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+legacy_health() {
+  local nonce status assets url digest downloaded matched deadline=$((SECONDS + 20))
+  while (( SECONDS < deadline )); do
+    nonce=$(openssl rand -hex 12) || return 1
+    if status=$(curl -q --silent --show-error --proto '=https' --connect-timeout 2 --max-time 4 \
+        -H 'Cache-Control: no-cache, no-store' -D "$work/legacy.headers" -o "$work/legacy.html" \
+        -w '%{http_code}' "$SITE/?rollback_check=$nonce") &&
+        [[ "$status" = 200 ]] &&
+        ! grep -qi '^x-4ss-release:' "$work/legacy.headers" &&
+        assets=$(python3 -I -B "$VERIFIER" legacy-assets "$work/legacy.html" "$previous"); then
+      matched=0
+      while read -r url digest; do
+        digest=${digest%$'\r'}
+        if download "$SITE$url?rollback_check=$nonce" "$work/legacy.asset" 4 8388608 &&
+           downloaded=$(sha256sum "$work/legacy.asset") && [[ "${downloaded%% *}" = "$digest" ]]; then
+          matched=$((matched + 1))
+        fi
+      done <<< "$assets"
+      if (( matched == 2 )); then
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+verify_only() (
+  local scratch
+  scratch=$(mktemp -d /tmp/fourss-verify.XXXXXXXX)
+  trap 'rm -rf -- "$scratch"' EXIT
+  mkdir "$scratch/release"
+  prepare "$2" "$scratch" "$scratch/release"
+  echo "Verified and unpacked $2 in scratch space. Activation skipped."
+)
+
+if [[ "${1:-}" == --verify-only && $# == 2 ]]; then
+  verify_only "$@"
+  exit "$?"
+fi
+(( $# == 0 )) || die "Usage: cpanel-deploy.sh [--verify-only FULL_SHA]"
+test -x "$NODE" || die "EA Node.js 22 is required"
+test -r "$APP/.env.production" || die "Production environment is missing or unreadable"
 test -s "$DATA/site.db" && test -r "$DATA/site.db" && test -w "$DATA/site.db" && test -w "$DATA" ||
-  { echo "Existing SQLite database and its directory must be writable"; exit 1; }
+  die "Existing SQLite database and its directory must be writable"
 if [[ -e "$DATA/uploads" && ! ( -d "$DATA/uploads" && -w "$DATA/uploads" && -x "$DATA/uploads" ) ]]; then
-  echo "Existing uploads directory must be writable and searchable"
-  exit 1
+  die "Existing uploads directory must be writable and searchable"
 fi
 
 mkdir -p "$APP/releases" "$APP/tmp"
+[[ "$(stat -c %d "$APP")" = "$(stat -c %d "$APP/tmp")" ]] ||
+  die "Passenger root and deployment staging must be on the same filesystem"
 exec 9>"$APP/tmp/deploy.lock"
-flock -n 9 || { echo "Another deployment is running"; exit 1; }
+flock -n 9 || die "Another deployment is running"
+transaction="$APP/tmp/deploy-recovery"
+[[ ! -e "$transaction" && ! -L "$transaction" ]] || die "Pending deployment recovery at $transaction. See DEPLOY.md"
+[[ -L "$APP/current" && -f "$APP/app.js" && ! -L "$APP/app.js" ]] ||
+  die "Expected an existing release symlink and Passenger launcher"
+previous=$(realpath -e -- "$APP/current")
+[[ "$previous" == "$APP/releases/"* && -s "$previous/.next/BUILD_ID" ]] || die "Invalid previous release"
+previous_sha=$(python3 -I -B - "$previous" <<'PY'
+import json
+from pathlib import Path
+import re
+import sys
 
-commit=$(git -C "$REPO" rev-parse HEAD)
-release=$(mktemp -d "$APP/releases/${commit:0:12}.XXXXXXXX")
-pending="$APP/tmp/current.new"
-launcher="$APP/tmp/app.js.new"
-cleanup() {
-  rm -f -- "$pending" "$launcher"
-  if [[ "$(readlink -f -- "$APP/current")" != "$release" ]]; then
-    rm -rf -- "$release"
+build = Path(sys.argv[1]) / ".next"
+commit = (build / "BUILD_ID").read_text().strip()
+rules = json.loads((build / "routes-manifest.json").read_text()).get("headers", [])
+if re.fullmatch(r"[a-f0-9]{40}", commit) and any(
+    rule["source"] == "/" and {"key": "X-4SS-Release", "value": commit} in rule["headers"]
+    for rule in rules
+):
+    print(commit)
+PY
+) || die "Could not inspect the previous release"
+
+commit=$(git -C "$REPO" rev-parse --verify HEAD^{commit})
+[[ "$commit" =~ ^[a-f0-9]{40}$ ]] || die "Invalid repository HEAD"
+[[ "$(git -C "$REPO" symbolic-ref --quiet HEAD)" == refs/heads/main ]] || die "Expected checked-out main"
+work=$(mktemp -d "$APP/tmp/prebuilt.XXXXXXXX")
+release=""
+activating=0
+succeeded=0
+rollback_health() {
+  if [[ -n "$previous_sha" ]]; then
+    health "$previous_sha" "$work/rollback.headers"
+  else
+    legacy_health
   fi
 }
+
+cleanup() {
+  local status=$?
+  trap - EXIT
+  trap '' INT TERM HUP
+  if (( activating && ! succeeded )); then
+    echo "4SS activation failed for $commit. Restoring $previous." >&2
+    if cp -p -- "$transaction/app.js" "$work/restore-app.js" &&
+       mv -Tf -- "$work/restore-app.js" "$APP/app.js" &&
+       ln -s -- "$previous" "$work/restore-current" &&
+       mv -Tf -- "$work/restore-current" "$APP/current" &&
+       touch "$APP/tmp/restart.txt" &&
+       rollback_health; then
+      echo "Previous release restored and verified." >&2
+      rm -rf -- "$transaction"
+    else
+      echo "Rollback could not be confirmed. Recovery files: $transaction" >&2
+    fi
+    status=1
+  fi
+  if [[ -n "$release" && ! -e "$transaction" ]] && (( ! succeeded )); then
+    rm -rf -- "$release"
+  fi
+  rm -rf -- "$work"
+  exit "$status"
+}
 trap cleanup EXIT
-rm -f -- "$pending" "$launcher"
+trap 'exit 1' INT TERM HUP
 
-echo "Building $commit in $release"
-git -C "$REPO" archive "$commit" | tar -x -C "$release"
-cd "$release"
+# A repeat click can confirm a release that is already running.
+if [[ "$previous_sha" = "$commit" ]] && health "$commit" "$work/active.headers"; then
+  echo "4SS release $commit is already active and healthy"
+  exit 0
+fi
+release=$(mktemp -d "$APP/releases/${commit:0:12}.XXXXXXXX")
+prepare "$commit" "$work" "$release"
 
-# Build without loading production secrets or pointing Next at live CMS files.
-npm ci --include=dev --include=optional
-bash deploy/cpanel-build.sh
+(cd "$release" && timeout 10s "$NODE" -e 'require("sharp"); require("node:sqlite")') ||
+  die "Native runtime dependency check failed"
+ln -s -- "$APP/.env.production" "$release/.env.production"
+(cd "$release" && timeout 10s "$NODE" app.js --check-env) || die "Production environment check failed"
+"$NODE" --check "$release/app.js" || die "Candidate Passenger launcher has invalid syntax"
+[[ "$(git -C "$REPO" symbolic-ref --quiet HEAD)" == refs/heads/main &&
+   "$(git -C "$REPO" rev-parse --verify HEAD^{commit})" = "$commit" ]] ||
+  die "Checkout advanced while preparing the release. Retry Deploy HEAD Commit"
 
-ln -s "$APP/.env.production" .env.production
-node app.js --check-env
-install -m 600 app.js "$launcher"
-ln -s "$release" "$pending"
-mv -Tf -- "$pending" "$APP/current"
-mv -Tf -- "$launcher" "$APP/app.js"
+# Keep a persistent recovery record before the first live change.
+mkdir "$work/recovery"
+cp -p -- "$APP/app.js" "$work/recovery/app.js"
+printf '%s\n' "$previous" > "$work/recovery/previous-release"
+printf '%s\n' "$commit" > "$work/recovery/candidate-sha"
+ln -s -- "$release" "$work/next-current"
+if ! cmp -s "$APP/app.js" "$release/app.js"; then
+  install -m 600 "$release/app.js" "$work/next-app.js"
+fi
+mv -T -- "$work/recovery" "$transaction"
+activating=1
+if [[ -f "$work/next-app.js" ]]; then
+  mv -Tf -- "$work/next-app.js" "$APP/app.js"
+fi
+mv -Tf -- "$work/next-current" "$APP/current"
 touch "$APP/tmp/restart.txt"
-echo "Activated $commit and requested Passenger restart."
+health "$commit" "$work/candidate.headers" || die "Passenger did not serve $commit before the deadline"
+succeeded=1
+rm -rf -- "$transaction"
+echo "4SS release $commit is active and healthy"

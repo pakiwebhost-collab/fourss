@@ -1,8 +1,22 @@
-import type { NextConfig } from "next";
-
 const cpanelBuild = process.env.CPANEL_BUILD === "1";
+const releaseCommit = process.env.FOURSS_RELEASE_COMMIT;
 
-const nextConfig: NextConfig = {
+if (releaseCommit && !/^[a-f0-9]{40}$/.test(releaseCommit)) {
+  throw new Error("FOURSS_RELEASE_COMMIT must be a full Git SHA.");
+}
+
+/** @type {import("next").NextConfig} */
+const nextConfig = {
+  ...(releaseCommit && {
+    generateBuildId: async () => releaseCommit,
+    headers: async () => [{
+      source: "/",
+      headers: [
+        { key: "X-4SS-Release", value: releaseCommit },
+        { key: "Cache-Control", value: "private, no-store" },
+      ],
+    }],
+  }),
   // Keep WordPress-style URLs (e.g. /about-us/) so existing links and SEO rankings carry over.
   trailingSlash: true,
   serverExternalPackages: ["sanitize-html", "nodemailer"],

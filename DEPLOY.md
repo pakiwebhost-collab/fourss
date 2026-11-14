@@ -39,86 +39,148 @@ Works on DigitalOcean, Hetzner, Contabo, AWS Lightsail and similar (1 GB RAM is 
 
 ## Option B — Manual cPanel Git deployment with Passenger
 
-For the 4SS demo, register `4ss.spydermesh.com` at `/` in Application Manager, using
-`apps/fourss` as the application path, the production environment, and Passenger's default
-`app.js` startup file. Confirm Passenger uses `/opt/cpanel/ea-nodejs22/bin/node` and runs as
-`websitemake4u`. Use `/home/websitemake4u/repositories/fourss` for the separate cPanel Git checkout.
+Production uses the cPanel account `websitemake4u`, the Git checkout at
+`/home/websitemake4u/repositories/fourss`, and the Passenger app at
+`/home/websitemake4u/apps/fourss` with EA Node.js 22.23.4 and `app.js`.
+The existing `.env.production`, SQLite DB and uploads keep their current locations.
+Only GitHub Actions installs npm dependencies and builds the application.
 
-The existing `/home/websitemake4u/apps/fourss/.env.production` must be readable by the app user.
-Confirm the effective `SITE_URL=https://4ss.spydermesh.com`, `DATA_DIR=/home/websitemake4u/4ss-data`,
-and `SESSION_SECRET` (at least 32 characters). Keep secure cookies enabled. Passenger-injected
-environment variables take precedence over `.env.production`. The existing SQLite database,
-its directory, and the uploads directory must be writable by the app user for WAL and CMS uploads.
-Keep the environment, SQLite database, and uploads outside the Git checkout and document root.
+### One-time signing setup
 
-After the desired commit reaches GitHub, use **Git Version Control → Manage → Pull or Deploy →
-Update from Remote**. Verify the expected HEAD and run the isolated server preflight below before
-clicking **Deploy HEAD Commit**. The deployment installs locked dependencies and builds with
-Webpack in a fresh release. It links the production environment after the build succeeds, checks
-its effective settings, switches `current`, then touches `tmp/restart.txt`. Builds may download
-SWC WebAssembly bindings and Google Fonts. The shared `deploy/cpanel-build.sh` logs the inherited
-address-space limits and raises only the build subshell's soft limit to the inherited hard limit.
-It uses Node 22's `--disable-wasm-trap-handler`, limits glibc malloc arenas and native CSS
-Rayon threads to two each, and lets Webpack process up to four modules at a time. Next.js keeps
-the server, edge, and client compilations in separate, sequential workers and uses one page-data
-worker. The 2 GB heap setting applies to the main process and Webpack compiler worker. Next.js
-removes it from isolated page-data workers.
+Generate a dedicated RSA signing key off-server, in a private directory outside the repository.
+Keep an offline backup of the private key. Verify its public fingerprint over a trusted channel.
 
-### AlmaLinux preflight
+```bash
+umask 077
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out fourss-release-signing.pem
+openssl pkey -in fourss-release-signing.pem -pubout -out release-signing.pub.pem
+openssl pkey -pubin -in release-signing.pub.pem -outform DER | openssl dgst -sha256
+```
 
-Run as the cPanel app user from a terminal after **Update from Remote**. The subshell enforces the
-same 8 GiB soft and hard address-space limits as cPanel. It builds and starts an isolated copy with
-a fresh test database. Keep the terminal open while running the smoke checks.
+1. In GitHub **Settings → Environments**, create `cpanel-release-signing`. Restrict its deployment
+   branches to `main`. Store the full private PEM as environment secret `FOURSS_RELEASE_SIGNING_KEY`.
+   Protect `main` and require review for changes to the workflow, packaging, and cPanel scripts.
+   The publish job signs on a separate runner and never runs build dependencies. GitHub
+   Releases contains public assets. Keep every private input outside the build container.
+   Enable immutable releases if available.
+2. Later, as the cPanel account, install only the public PEM from the trusted copy. No root or
+   GitHub token is needed on the VPS. Confirm the key fingerprint after uploading.
+
+   ```bash
+   install -d -m 700 "$HOME/.config/fourss"
+   install -m 600 /path/to/trusted/release-signing.pub.pem "$HOME/.config/fourss/release-signing.pub.pem"
+   openssl pkey -pubin -in "$HOME/.config/fourss/release-signing.pub.pem" -outform DER | openssl dgst -sha256
+   command -v curl openssl python3 timeout flock realpath stat awk
+   /opt/cpanel/ea-nodejs22/bin/node -v
+   getconf GNU_LIBC_VERSION
+   uname -m
+   ```
+
+If rotating keys, coordinate the publisher secret and the separately provisioned public key.
+Previously installed releases can still be rolled back locally. New activations require a
+manifest signed with the currently trusted key. For a failed publish, inspect any draft for
+that exact SHA and remove an incomplete draft before rerunning. A published immutable release
+is retained. Push a new approved commit when rebuilding a published artifact.
+
+### Disposable cPanel Git task
+
+Keep the production checkout and hook out of this test. After separately approved publication,
+wait for the green Actions run and the three assets on release `cpanel-<full-sha>`. Reuse
+`$HOME/repositories/fourss-socket-probe` or create an empty disposable Git Version Control
+repository there. Copy `cpanel-deploy.sh` and `verify-release.py` from the reviewed revision into
+that disposable repository. Its test `.cpanel.yml` should contain the following, with the full
+published SHA substituted.
+
+```yaml
+---
+deployment:
+  tasks:
+    - /bin/bash /home/websitemake4u/repositories/fourss-socket-probe/cpanel-deploy.sh --verify-only FULL_PUBLISHED_SHA
+```
+
+Commit those three files in the disposable checkout:
 
 ```bash
 (
 set -euo pipefail
-export PATH="/opt/cpanel/ea-nodejs22/bin:$PATH"
-test "$(node -v)" = v22.23.4
-test "$(getconf GNU_LIBC_VERSION)" = 'glibc 2.28'
-command -v git tar flock install
-ulimit -S -H -v 8388608
-test_dir=$(mktemp -d "$HOME/4ss-preflight.XXXXXXXX")
-git -C "$HOME/repositories/fourss" archive HEAD | tar -x -C "$test_dir"
-cd "$test_dir"
-npm ci --include=dev --include=optional
-node -e 'const {DatabaseSync}=require("node:sqlite"); const db=new DatabaseSync(":memory:"); console.log(db.prepare("SELECT sqlite_version() AS version").get()); console.log(require("sharp").versions.sharp)'
-DEBUG=next:build:webpack-build bash deploy/cpanel-build.sh 2>&1 | tee build.log
-grep -F 'next-swc build: wasm build' build.log
-DATA_DIR="$test_dir/test-data" SITE_URL=https://4ss.spydermesh.com REQUIRE_EXISTING_DB=0 \
-  PORT=4313 node app.js
+cd "$HOME/repositories/fourss-socket-probe"
+test "$(git rev-parse --show-toplevel)" = "$PWD"
+git add -- .cpanel.yml cpanel-deploy.sh verify-release.py
+git -c user.name='4SS Release Probe' -c user.email='release-probe@example.invalid' \
+  commit -m 'Verify a signed cPanel release without activation'
+git status --short
 )
 ```
 
-From a second terminal run `curl -fsS http://127.0.0.1:4313/ -o /dev/null`,
-`curl -fsS http://127.0.0.1:4313/admin/login/ -o /dev/null`, and
-`curl -fsS http://127.0.0.1:4313/sitemap.xml | grep -F 'https://4ss.spydermesh.com/'`.
-Stop the test process with Ctrl+C. Check the actual Passenger integration separately using an
-isolated staging registration where available. Before a live activation, take a consistent SQLite
-backup and retain the prior app release. After activation, check Passenger logs, HTTPS redirects,
-admin login, and static assets. Next.js fetches Server Action redirect responses through the
-demo origin under Passenger, so confirm the app user can reach that HTTPS origin from the VPS.
-On subsequent releases, rollback consists of repointing `current`
-to the retained prior release and touching `tmp/restart.txt`. For the first migration, also keep
-a copy of the previous startup file and retain the original app directory contents. Older releases
-remain on disk for rollback. Remove unused releases after confirming they are no longer serving.
+In cPanel **Manage → Pull or Deploy**,
+confirm the disposable path, then click **Deploy HEAD Commit**. Expect the exact SHA and
+`Activation skipped` in the completed task log at `~/.cpanel/logs/vc_*_git_deploy.log`.
+This mode uses a private directory under `/tmp` and inspects archive metadata and file bytes.
+It executes no downloaded code and never reads the live app or DB.
+Repeat in the disposable repository with an unpublished full SHA and confirm a nonzero task
+result. Time the successful task to establish the cPanel job budget. The download, unpack and
+health deadlines are per phase. A slow host may need a shorter release-check budget or faster
+artifact access before live cutover.
 
-If the build still aborts, capture the last Next.js phase and the limits reported by the failing
-execution context. In the cPanel terminal, run `ulimit -Sa; ulimit -Ha` and, if readable,
-`cat /proc/$$/limits`. During compilation, read `VmPeak`, `VmSize`, `VmRSS`, and `Threads` from
-`/proc/<compiler-pid>/status`, and inspect `/proc/<compiler-pid>/maps` if available. V8's heap
-statistics cover only part of the virtual address space. The terminal and Git deployment task can
-inherit different limits.
-A hard address-space cap, a data-segment limit, or an account memory limit can prevent V8 from
-growing the heap well below its configured ceiling. WHM `maxmem` and the Node heap setting alone
-do not establish the worker's available memory. If the terminal preflight succeeds but the Git
-task fails, run the same checked-out deployment script as the app user from the working terminal
-context. If both contexts fail under the cap, build in a clean AlmaLinux 8/GLIBC 2.28 environment
-with the same architecture and Node version. Stage the tested release on the VPS under the Git
-commit SHA, then manually activate it with the same `current` symlink and Passenger restart. Keep
-production secrets and data outside the artifact. To retain **Deploy HEAD Commit** with off-server
-builds, the deploy hook would need an explicit artifact verification and activation step in place
-of the local compilation. Windows build output is unsuitable for that transfer.
+The verification-only task proves download, signature verification, extraction and the
+presence of Linux x64 Sharp and libvips files. The CI smoke test and separate Passenger
+staging app exercise native loading.
+To validate switching, rollback, and the Passenger SHA response before live cutover, use a
+separate disposable Passenger registration and a copy of the deploy script pointed only at
+that registration and its fixture files. Adapt the disposable launcher's production environment
+check to the fixture domain and data path, and use a separately signed test artifact whose
+launcher accepts that fixture. Exercise a successful switch and force the candidate health
+check to fail. Confirm recovery of the prior launcher and symlink, and that the disposable
+SQLite file and uploads remain outside the releases. Keep the production paths out of both
+tests.
+
+### Live workflow after validation and approval
+
+Push only to GitHub. Wait for Actions to publish the exact commit's release. In the production
+checkout use **Update from Remote**, confirm the SHA, then **Deploy HEAD Commit**. The hook
+downloads and verifies the signed manifest before fetching the archive. It checks the digest
+and runtime layout, rejects escaping paths and links, and leaves the existing release active
+until candidate validation succeeds. It replaces the launcher atomically only when its
+verified bytes differ. Passenger health must return the selected SHA over HTTPS. For the first
+rollback to the legacy release, the hook checks the restored pointer and launcher, then
+requires a cache-bypassed homepage response without the candidate SHA header. The HTML must
+refer to both a stylesheet and a script in the restored release, and their served SHA-256
+digests must match the restored files. If those checks fail, the hook retains the recovery
+record and reports the rollback as unconfirmed. The legacy release cannot attest its Git SHA.
+
+A failed download or validation leaves the current release untouched. A failure after
+switching can briefly affect traffic while the hook restores the previous launcher and
+release, signals Passenger, and checks recovery. Inspect the final cPanel task log. If the
+task is forcibly killed, inspect `apps/fourss/tmp/deploy-recovery` before retrying. Recover
+as the app user while holding the same deployment lock:
+
+```bash
+(
+set -euo pipefail
+app="$HOME/apps/fourss"
+recovery="$app/tmp/deploy-recovery"
+exec 9>"$app/tmp/deploy.lock"
+flock -n 9
+previous=$(realpath -e -- "$(cat "$recovery/previous-release")")
+[[ "$previous" == "$app/releases/"* && -s "$previous/.next/BUILD_ID" ]]
+work=$(mktemp -d "$app/tmp/restore.XXXXXXXX")
+trap 'rm -rf -- "$work"' EXIT
+cp -p -- "$recovery/app.js" "$work/app.js"
+ln -s -- "$previous" "$work/current"
+mv -Tf -- "$work/app.js" "$app/app.js"
+mv -Tf -- "$work/current" "$app/current"
+touch "$app/tmp/restart.txt"
+echo "Restored $previous. Verify Passenger before removing $recovery."
+)
+```
+
+Verify the restored site with a cache-bypassed request and compare the response SHA when the
+previous release supports it. For the legacy release, use `verify-release.py legacy-assets
+<saved-homepage.html> <previous-release-directory>` to obtain the expected URLs and digests.
+Compare them with fresh HTTPS responses before clearing the recovery record. Retain at least one
+known-good release on the VPS and its artifact on GitHub. For a planned rollback, use the same
+lock, point `current` at the retained release, restore its compatible launcher if needed, and
+request a restart.
 
 ---
 
