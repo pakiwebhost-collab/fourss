@@ -63,6 +63,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.build.outputs.artifact-id }}
           path: ${{ runner.temp }}/fourss-release
+          merge-multiple: true
       - name: Check manifest and sign the tested artifact
         working-directory: ${{ runner.temp }}/fourss-release
         env:
