@@ -45,8 +45,12 @@ def unpack(archive, destination):
         raise ValueError("extraction directory must be empty")
     with tarfile.open(archive, "r|gz") as source:
         for entry in source:
-            parts = entry.name.split("/")
-            if (len(seen) >= 100000 or entry.name in seen or
+            # GNU tar can leave a trailing slash in directory names from PAX headers.
+            name = entry.name
+            if entry.isdir() and name.endswith("/"):
+                name = name[:-1]
+            parts = name.split("/")
+            if (len(seen) >= 100000 or name in seen or
                     any(part in ("", ".", "..") or "\\" in part or
                         ":" in part or any(ord(c) < 32 for c in part) for part in parts) or
                     not (entry.isfile() or entry.isdir()) or
@@ -62,7 +66,7 @@ def unpack(archive, destination):
             expanded += entry.size
             if expanded > MAX_EXPANDED:
                 raise ValueError("expanded archive exceeds size limit")
-            seen.add(entry.name)
+            seen.add(name)
             target = os.path.join(destination, *parts)
             if entry.isdir():
                 os.makedirs(target, mode=0o700, exist_ok=True)
